@@ -4,7 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 from rdflib import Namespace
 from brickschema.namespaces import BRICK, A
-from brickschema import Graph
+from rdflib import Graph
 
 BLDG = Namespace("urn:bldg#")
 
@@ -28,7 +28,7 @@ triple_table_defn = """CREATE TABLE IF NOT EXISTS triples (
 triple_unique_idx = """CREATE UNIQUE INDEX IF NOT EXISTS triple_unique_idx
     ON triples (graph, subject, predicate, object);"""
 
-class Changeset(Graph):
+class Changeset():
     def __init__(self, graph_name):
         self.name = graph_name
         self.uid = uuid.uuid4()
@@ -41,6 +41,9 @@ class Changeset(Graph):
     def remove(self, triple):
         self.deletions.append(triple)
 
+    def __repr__(self):
+        return f"Changeset {self.name} {self.uid}\n|- {len(self.additions)} additions\n|- {len(self.deletions)} deletions"
+
 class DB:
     def __init__(self, file_name):
         self.file_name = file_name
@@ -52,7 +55,7 @@ class DB:
         self.conn.execute(triple_unique_idx)
 
     @contextmanager
-    def new_changeset(self, graph, ts=None):
+    def new_changeset(self, graph: str, ts: str=None):
         with self.conn:
             cs = Changeset(graph)
             yield cs
@@ -71,12 +74,13 @@ class DB:
                     (str(cs.uid), ts, graph, False, triple[0].n3(), triple[1].n3(), triple[2].n3()))
                 self.conn.execute("INSERT OR IGNORE INTO triples VALUES (NULL, ?, ?, ?, ?)",
                     (graph, triple[0].n3(), triple[1].n3(), triple[2].n3()))
+        print(f"Committed changeset: {cs}")
 
-    def triples(self, graph):
+    def triples(self, graph: str):
         for row in self.conn.execute("SELECT * FROM triples WHERE graph = ?", (graph,)):
             yield row
 
-    def latest(self, graph):
+    def latest(self, graph: str) -> Graph:
         g = Graph()
         f = ""
         for row in self.conn.execute("SELECT * FROM triples WHERE graph = ?", (graph,)):
@@ -84,20 +88,22 @@ class DB:
         g.parse(data=f, format="turtle")
         return g
 
-    def graph_at(self, graph, timestamp=None):
+    def graph_at(self, graph: str, timestamp=None) -> Graph:
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
         g = self.latest(graph)
 
+        # producing the graph is a little wonky...we store the triples in separate fields,
+        # but in order to load them into the graph, we create an in-memory n-triples file
+        # and hand it to rdflib to parse. At this point, GitHub copilot suggested to add
+        # the phrase "this is a hack but it works" to the comment.
         additions = ""
         deletions = ""
         for row in self.conn.execute("SELECT * FROM changesets WHERE graph = ? AND timestamp > ?", (graph, timestamp)):
             if row["is_insertion"]:
                 additions += f"{row['subject']} {row['predicate']} {row['object']} .\n"
-                #g.add((row["subject"], row["predicate"], row["object"]))
             else:
                 deletions += f"{row['subject']} {row['predicate']} {row['object']} .\n"
-                #g.remove((row["subject"], row["predicate"], row["object"]))
         addGraph = Graph()
         addGraph.parse(data=additions, format="turtle")
         delGraph = Graph()
