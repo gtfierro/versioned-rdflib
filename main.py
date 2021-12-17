@@ -63,14 +63,14 @@ class DB:
             # as "deletions".
             for triple in cs.deletions:
                 self.conn.execute("INSERT INTO changesets VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (str(cs.uid), ts, graph, True, triple[0], triple[1], triple[2]))
+                    (str(cs.uid), ts, graph, True, triple[0].n3(), triple[1].n3(), triple[2].n3()))
                 self.conn.execute("DELETE FROM triples WHERE graph = ? AND subject = ? AND predicate = ? AND object = ?",
-                    (graph, triple[0], triple[1], triple[2]))
+                    (graph, triple[0].n3(), triple[1].n3(), triple[2].n3()))
             for triple in cs.additions:
                 self.conn.execute("INSERT INTO changesets VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (str(cs.uid), ts, graph, False, triple[0], triple[1], triple[2]))
+                    (str(cs.uid), ts, graph, False, triple[0].n3(), triple[1].n3(), triple[2].n3()))
                 self.conn.execute("INSERT OR IGNORE INTO triples VALUES (NULL, ?, ?, ?, ?)",
-                    (graph, triple[0], triple[1], triple[2]))
+                    (graph, triple[0].n3(), triple[1].n3(), triple[2].n3()))
 
     def triples(self, graph):
         for row in self.conn.execute("SELECT * FROM triples WHERE graph = ?", (graph,)):
@@ -78,20 +78,31 @@ class DB:
 
     def latest(self, graph):
         g = Graph()
+        f = ""
         for row in self.conn.execute("SELECT * FROM triples WHERE graph = ?", (graph,)):
-            g.add((row["subject"], row["predicate"], row["object"]))
+            f += f"{row['subject']} {row['predicate']} {row['object']} .\n"
+        g.parse(data=f, format="turtle")
         return g
 
     def graph_at(self, graph, timestamp=None):
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
         g = self.latest(graph)
+
+        additions = ""
+        deletions = ""
         for row in self.conn.execute("SELECT * FROM changesets WHERE graph = ? AND timestamp > ?", (graph, timestamp)):
             if row["is_insertion"]:
-                g.add((row["subject"], row["predicate"], row["object"]))
+                additions += f"{row['subject']} {row['predicate']} {row['object']} .\n"
+                #g.add((row["subject"], row["predicate"], row["object"]))
             else:
-                g.remove((row["subject"], row["predicate"], row["object"]))
-        return g
+                deletions += f"{row['subject']} {row['predicate']} {row['object']} .\n"
+                #g.remove((row["subject"], row["predicate"], row["object"]))
+        addGraph = Graph()
+        addGraph.parse(data=additions, format="turtle")
+        delGraph = Graph()
+        delGraph.parse(data=deletions, format="turtle")
+        return g - delGraph + addGraph
 
     def close(self):
         self.conn.close()
