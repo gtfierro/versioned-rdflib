@@ -44,6 +44,10 @@ class Changeset():
     def __repr__(self):
         return f"Changeset {self.name} {self.uid}\n|- {len(self.additions)} additions\n|- {len(self.deletions)} deletions"
 
+# TODO: make this a subclass of rdflib.Dataset or ConjunctiveGraph?
+# maybe also support a "union" over multiple graphs?
+# We can define several "virtual unions" and include them in the graph.
+# Maybe a virtual union can be a union over graphs and other virtual unions?
 class DB:
     def __init__(self, file_name):
         self.file_name = file_name
