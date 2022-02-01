@@ -1,12 +1,16 @@
-from typing import Union
 from datetime import datetime
-import time
 import uuid
-import sqlite3
+import time
 from contextlib import contextmanager
 from rdflib import Namespace
 from brickschema.namespaces import BRICK, A
-from rdflib import Graph
+from rdflib import Graph, ConjunctiveGraph
+from rdflib import plugin
+from rdflib.store import Store
+from rdflib_sqlalchemy import registerplugins
+import pickle
+
+registerplugins()
 
 BLDG = Namespace("urn:bldg#")
 
@@ -15,22 +19,20 @@ changeset_table_defn = """CREATE TABLE IF NOT EXISTS changesets (
     timestamp TIMESTAMP NOT NULL,
     graph TEXT NOT NULL,
     is_insertion BOOLEAN NOT NULL,
-    subject TEXT NOT NULL,
-    predicate TEXT NOT NULL,
-    object TEXT NOT NULL
+    triple BLOB NOT NULL
 );"""
 
-triple_table_defn = """CREATE TABLE IF NOT EXISTS triples (
-    id INTEGER PRIMARY KEY,
-    graph TEXT NOT NULL,
-    subject TEXT NOT NULL,
-    predicate TEXT NOT NULL,
-    object TEXT NOT NULL
-);"""
-triple_unique_idx = """CREATE UNIQUE INDEX IF NOT EXISTS triple_unique_idx
-    ON triples (graph, subject, predicate, object);"""
+# triple_table_defn = """CREATE TABLE IF NOT EXISTS triples (
+#     id INTEGER PRIMARY KEY,
+#     graph TEXT NOT NULL,
+#     subject TEXT NOT NULL,
+#     predicate TEXT NOT NULL,
+#     object TEXT NOT NULL
+# );"""
+# triple_unique_idx = """CREATE UNIQUE INDEX IF NOT EXISTS triple_unique_idx
+#     ON triples (graph, subject, predicate, object);"""
 
-class Changeset():
+class Changeset(Graph):
     def __init__(self, graph_name):
         self.name = graph_name
         self.uid = uuid.uuid4()
@@ -43,115 +45,83 @@ class Changeset():
     def load_file(self, filename):
         g = Graph()
         g.parse(filename, format="turtle")
-        for s, p, o in g.triples((None, None, None)):
-            self.add((s, p, o))
+        self.additions.extend(g.triples((None, None, None)))
 
     def remove(self, triple):
         self.deletions.append(triple)
 
-    def __repr__(self):
-        return f"Changeset {self.name} {self.uid}\n|- {len(self.additions)} additions\n|- {len(self.deletions)} deletions"
-
-# TODO: make this a subclass of rdflib.Dataset or ConjunctiveGraph?
-# maybe also support a "union" over multiple graphs?
-# We can define several "virtual unions" and include them in the graph.
-# Maybe a virtual union can be a union over graphs and other virtual unions?
-class DB:
-    def __init__(self, file_name):
+class DB(ConjunctiveGraph):
+    def __init__(self, file_name, *args, **kwargs):
+        store = plugin.get("SQLAlchemy", Store)(identifier="my_store")
+        super().__init__(store, *args, **kwargs)
         self.file_name = file_name
-        self.conn = sqlite3.connect(self.file_name)
-        self.conn.row_factory = sqlite3.Row
-        self.cursor = self.conn.cursor()
-        self.conn.execute(changeset_table_defn)
-        self.conn.execute(triple_table_defn)
-        self.conn.execute(triple_unique_idx)
+        self.open(f"sqlite:///{self.file_name}", create=True)
 
-        self.latest_changed = True
-        self._cached_graph = Graph()
+        with self.conn() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(changeset_table_defn)
 
     @contextmanager
-    def new_changeset(self, graph: str, ts: Union[str,int]=None):
-        with self.conn:
-            cs = Changeset(graph)
+    def conn(self):
+        yield self.store.engine.connect()
+
+    @contextmanager
+    def new_changeset(self, graph_name, ts=None):
+        with self.conn() as conn:
+            graph = self.get_context(graph_name)
+            transaction_start = time.time()
+            cs = Changeset(graph_name)
             yield cs
             if ts is None:
                 ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
             # delta by the user. We need to invert the changes so that they are expressed as a "backward"
             # delta. This means that we save the deletions in the changeset as "inserts", and the additions
             # as "deletions".
-            for triple in cs.deletions:
-                self.conn.execute("INSERT INTO changesets VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (str(cs.uid), ts, graph, True, triple[0].n3(), triple[1].n3(), triple[2].n3()))
-                self.conn.execute("DELETE FROM triples WHERE graph = ? AND subject = ? AND predicate = ? AND object = ?",
-                    (graph, triple[0].n3(), triple[1].n3(), triple[2].n3()))
-            for triple in cs.additions:
-                self.conn.execute("INSERT INTO changesets VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (str(cs.uid), ts, graph, False, triple[0].n3(), triple[1].n3(), triple[2].n3()))
-                self.conn.execute("INSERT OR IGNORE INTO triples VALUES (NULL, ?, ?, ?, ?)",
-                    (graph, triple[0].n3(), triple[1].n3(), triple[2].n3()))
-        print(f"Committed changeset: {cs}")
-        self.latest_changed = True
+            if cs.deletions:
+                conn.exec_driver_sql("INSERT INTO changesets VALUES (?, ?, ?, ?, ?)",
+                        [(str(cs.uid), ts, graph_name, True, pickle.dumps(triple)) for triple in cs.deletions])
+                for triple in cs.deletions:
+                    graph.remove(triple)
+            if cs.additions:
+                conn.exec_driver_sql("INSERT INTO changesets VALUES (?, ?, ?, ?, ?)",
+                        [(str(cs.uid), ts, graph_name, False, pickle.dumps(triple)) for triple in cs.additions])
+                for triple in cs.additions:
+                    graph.add(triple)
+            transaction_end = time.time()
+            print(f"Transaction took {transaction_end - transaction_start} seconds")
 
-    def triples(self, graph: str):
-        for row in self.conn.execute("SELECT * FROM triples WHERE graph = ?", (graph,)):
-            yield row
+    def latest(self, graph):
+        return self.get_context(graph)
 
-    def latest(self, graph: str) -> Graph:
-        if not self.latest_changed:
-            return self._cached_graph
-        g = Graph()
-        f = ""
-        for row in self.conn.execute("SELECT * FROM triples WHERE graph = ?", (graph,)):
-            f += f"{row['subject']} {row['predicate']} {row['object']} .\n"
-        g.parse(data=f, format="turtle")
-        self.latest_changed = False
-        self._cached_graph = g
-        return g
-
-    def graph_at(self, graph: str, timestamp=None) -> Graph:
+    def graph_at(self, graph, timestamp=None):
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
         g = self.latest(graph)
-
-        # producing the graph is a little wonky...we store the triples in separate fields,
-        # but in order to load them into the graph, we create an in-memory n-triples file
-        # and hand it to rdflib to parse. At this point, GitHub copilot suggested to add
-        # the phrase "this is a hack but it works" to the comment.
-        additions = ""
-        deletions = ""
-        for row in self.conn.execute("SELECT * FROM changesets WHERE graph = ? AND timestamp > ? ORDER BY timestamp DESC", (graph, timestamp)):
-            if row["is_insertion"]:
-                additions += f"{row['subject']} {row['predicate']} {row['object']} .\n"
-            else:
-                deletions += f"{row['subject']} {row['predicate']} {row['object']} .\n"
-        addGraph = Graph()
-        addGraph.parse(data=additions, format="turtle")
-        delGraph = Graph()
-        delGraph.parse(data=deletions, format="turtle")
-        return g - delGraph + addGraph
-
-    def versions(self, graph) -> list[str]:
-        return [row["timestamp"] for row in self.conn.execute("SELECT DISTINCT timestamp FROM changesets WHERE graph = ?", (graph,))]
-
-    def close(self):
-        self.conn.close()
+        with self.conn() as conn:
+            for row in conn.execute("SELECT * FROM changesets WHERE graph = ? AND timestamp > ?", (graph, timestamp)):
+                triple = pickle.loads(row["triple"])
+                if row["is_insertion"]:
+                    g.add((triple[0], triple[1], triple[2]))
+                else:
+                    g.remove((triple[0], triple[1], triple[2]))
+        return g
 
 if __name__ == "__main__":
     db = DB("test.db")
 
     # using logical timestamps here (0, 1, 2, 3, ...). If these are
     # ommitted it defaults to the current system time.
-    with db.new_changeset("my-building", 0) as cs:
-        # 'cs' is a rdflib.Graph that supports queries -- updates on it
-        # are buffered in the transaction and cannot be queried until
-        # the transaction is committed (at the end of the context block)
-        cs.load_file("https://github.com/BrickSchema/Brick/releases/download/nightly/Brick.ttl")
-
     with db.new_changeset("my-building", 1) as cs:
         cs.add((BLDG.vav1, A, BRICK.VAV))
         cs.add((BLDG.vav1, BRICK.feeds, BLDG.zone1))
         cs.add((BLDG.zone1, A, BRICK.HVAC_Zone))
         cs.add((BLDG.zone1, BRICK.hasPart, BLDG.room1))
+
+    with db.new_changeset("brick", 1) as cs:
+        # 'cs' is a rdflib.Graph that supports queries -- updates on it
+        # are buffered in the transaction and cannot be queried until
+        # the transaction is committed (at the end of the context block)
+        cs.load_file("https://github.com/BrickSchema/Brick/releases/download/nightly/Brick.ttl")
 
     with db.new_changeset("my-building", 2) as cs:
         cs.add((BLDG.vav2, A, BRICK.VAV))
@@ -170,12 +140,12 @@ if __name__ == "__main__":
         cs.add((BLDG.vav2, BRICK.feeds, BLDG.zone2))
 
     print("LATEST!")
-    print(len(db.latest("my-building")))
+    for t in db.latest("my-building"):
+        print(t)
 
-    for logical_ts in db.versions("my-building"):
+    for logical_ts in range(1, 5):
         print("LOGICAL TS:", logical_ts)
-        t0 = time.time()
-        print(len(db.graph_at("my-building", logical_ts)))
-        print(f"Loaded graph in {time.time() - t0} seconds")
+        for t in db.graph_at("my-building", logical_ts):
+            print(t)
 
     db.close()
