@@ -142,6 +142,9 @@ if __name__ == "__main__":
     # using logical timestamps here (0, 1, 2, 3, ...). If these are
     # ommitted it defaults to the current system time.
     with db.new_changeset("my-building", 0) as cs:
+        # 'cs' is a rdflib.Graph that supports queries -- updates on it
+        # are buffered in the transaction and cannot be queried until
+        # the transaction is committed (at the end of the context block)
         cs.load_file("https://github.com/BrickSchema/Brick/releases/download/nightly/Brick.ttl")
 
     with db.new_changeset("my-building", 1) as cs:
