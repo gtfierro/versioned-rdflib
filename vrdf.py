@@ -54,6 +54,7 @@ class DB(ConjunctiveGraph):
 
         with self.conn() as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
+            #conn.execute("PRAGMA synchronous=OFF;")
             conn.execute(changeset_table_defn)
 
     def add_precommit_hook(self, hook):
@@ -96,8 +97,9 @@ class DB(ConjunctiveGraph):
                         for triple in cs.additions
                     ],
                 )
-                for triple in cs.additions:
-                    graph.add(triple)
+                graph.addN(((t[0], t[1], t[2], graph_name) for t in cs.additions))
+                #for triple in cs.additions:
+                #    graph.add(triple)
             transaction_end = time.time()
             print(f"Transaction took {transaction_end - transaction_start} seconds")
             for hook in self._precommit_hooks.values():
