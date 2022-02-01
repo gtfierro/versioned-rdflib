@@ -1,4 +1,5 @@
 rdflib
+pyshacl
 rdflib-sqlalchemy
 # using for namespace imports only...
 brickschema

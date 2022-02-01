@@ -1,4 +1,5 @@
 from datetime import datetime
+from collections import OrderedDict
 import uuid
 import time
 from contextlib import contextmanager
@@ -48,9 +49,18 @@ class DB(ConjunctiveGraph):
         self.file_name = file_name
         self.open(f"sqlite:///{self.file_name}", create=True)
 
+        self._precommit_hooks = OrderedDict()
+        self._postcommit_hooks = OrderedDict()
+
         with self.conn() as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute(changeset_table_defn)
+
+    def add_precommit_hook(self, hook):
+        self._precommit_hooks[hook.__name__] = hook
+
+    def add_postcommit_hook(self, hook):
+        self._postcommit_hooks[hook.__name__] = hook
 
     @contextmanager
     def conn(self):
@@ -90,6 +100,10 @@ class DB(ConjunctiveGraph):
                     graph.add(triple)
             transaction_end = time.time()
             print(f"Transaction took {transaction_end - transaction_start} seconds")
+            for hook in self._precommit_hooks.values():
+                hook(self)
+        for hook in self._postcommit_hooks.values():
+            hook(self)
 
     def latest(self, graph):
         return self.get_context(graph)
@@ -121,6 +135,17 @@ class DB(ConjunctiveGraph):
 if __name__ == "__main__":
     db = DB("test.db")
 
+    # can add precommit and postcommit hooks to implement desired functionality
+    # precommit hooks are run *before* the transaction is committed but *after* all of
+    # the changes have been made to the graph.
+    # postcommit hooks are run *after* the transaction is committed.
+    import pyshacl
+    def validate(graph):
+        print("Validating graph")
+        valid, _, report = pyshacl.validate(graph, advanced=True, allow_warnings=True)
+        assert valid, report
+    db.add_postcommit_hook(validate)
+
     # using logical timestamps here (0, 1, 2, 3, ...). If these are
     # ommitted it defaults to the current system time.
     with db.new_changeset("my-building", 1) as cs:
@@ -129,13 +154,13 @@ if __name__ == "__main__":
         cs.add((BLDG.zone1, A, BRICK.HVAC_Zone))
         cs.add((BLDG.zone1, BRICK.hasPart, BLDG.room1))
 
-    #with db.new_changeset("brick", 1) as cs:
-    #    # 'cs' is a rdflib.Graph that supports queries -- updates on it
-    #    # are buffered in the transaction and cannot be queried until
-    #    # the transaction is committed (at the end of the context block)
-    #    cs.load_file(
-    #        "https://github.com/BrickSchema/Brick/releases/download/nightly/Brick.ttl"
-    #    )
+    with db.new_changeset("brick", 1) as cs:
+        # 'cs' is a rdflib.Graph that supports queries -- updates on it
+        # are buffered in the transaction and cannot be queried until
+        # the transaction is committed (at the end of the context block)
+        cs.load_file(
+            "https://sparql.gtf.fyi/ttl/Brick1.3rc1.ttl"
+        )
 
     with db.new_changeset("my-building", 2) as cs:
         cs.add((BLDG.vav2, A, BRICK.VAV))
