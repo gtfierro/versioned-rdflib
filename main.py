@@ -94,10 +94,17 @@ class DB(ConjunctiveGraph):
     def latest(self, graph):
         return self.get_context(graph)
 
-    def graph_at(self, graph, timestamp=None):
+    def graph_at(self, graph=None, timestamp=None):
+        """
+        Return *copy* of the graph at the given timestamp. Chooses the most recent timestamp
+        that is less than or equal to the given timestamp.
+        """
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
-        g = self.latest(graph)
+        g = Graph()
+        if graph is not None:
+            for t in self.get_context(graph).triples((None, None, None)):
+                g.add(t)
         with self.conn() as conn:
             for row in conn.execute(
                 "SELECT * FROM changesets WHERE graph = ? AND timestamp > ?",
@@ -122,13 +129,13 @@ if __name__ == "__main__":
         cs.add((BLDG.zone1, A, BRICK.HVAC_Zone))
         cs.add((BLDG.zone1, BRICK.hasPart, BLDG.room1))
 
-    with db.new_changeset("brick", 1) as cs:
-        # 'cs' is a rdflib.Graph that supports queries -- updates on it
-        # are buffered in the transaction and cannot be queried until
-        # the transaction is committed (at the end of the context block)
-        cs.load_file(
-            "https://github.com/BrickSchema/Brick/releases/download/nightly/Brick.ttl"
-        )
+    #with db.new_changeset("brick", 1) as cs:
+    #    # 'cs' is a rdflib.Graph that supports queries -- updates on it
+    #    # are buffered in the transaction and cannot be queried until
+    #    # the transaction is committed (at the end of the context block)
+    #    cs.load_file(
+    #        "https://github.com/BrickSchema/Brick/releases/download/nightly/Brick.ttl"
+    #    )
 
     with db.new_changeset("my-building", 2) as cs:
         cs.add((BLDG.vav2, A, BRICK.VAV))
