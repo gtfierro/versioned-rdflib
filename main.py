@@ -22,16 +22,6 @@ changeset_table_defn = """CREATE TABLE IF NOT EXISTS changesets (
     triple BLOB NOT NULL
 );"""
 
-# triple_table_defn = """CREATE TABLE IF NOT EXISTS triples (
-#     id INTEGER PRIMARY KEY,
-#     graph TEXT NOT NULL,
-#     subject TEXT NOT NULL,
-#     predicate TEXT NOT NULL,
-#     object TEXT NOT NULL
-# );"""
-# triple_unique_idx = """CREATE UNIQUE INDEX IF NOT EXISTS triple_unique_idx
-#     ON triples (graph, subject, predicate, object);"""
-
 class Changeset(Graph):
     def __init__(self, graph_name):
         self.name = graph_name
@@ -49,6 +39,7 @@ class Changeset(Graph):
 
     def remove(self, triple):
         self.deletions.append(triple)
+
 
 class DB(ConjunctiveGraph):
     def __init__(self, file_name, *args, **kwargs):
@@ -78,13 +69,23 @@ class DB(ConjunctiveGraph):
             # delta. This means that we save the deletions in the changeset as "inserts", and the additions
             # as "deletions".
             if cs.deletions:
-                conn.exec_driver_sql("INSERT INTO changesets VALUES (?, ?, ?, ?, ?)",
-                        [(str(cs.uid), ts, graph_name, True, pickle.dumps(triple)) for triple in cs.deletions])
+                conn.exec_driver_sql(
+                    "INSERT INTO changesets VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (str(cs.uid), ts, graph_name, True, pickle.dumps(triple))
+                        for triple in cs.deletions
+                    ],
+                )
                 for triple in cs.deletions:
                     graph.remove(triple)
             if cs.additions:
-                conn.exec_driver_sql("INSERT INTO changesets VALUES (?, ?, ?, ?, ?)",
-                        [(str(cs.uid), ts, graph_name, False, pickle.dumps(triple)) for triple in cs.additions])
+                conn.exec_driver_sql(
+                    "INSERT INTO changesets VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (str(cs.uid), ts, graph_name, False, pickle.dumps(triple))
+                        for triple in cs.additions
+                    ],
+                )
                 for triple in cs.additions:
                     graph.add(triple)
             transaction_end = time.time()
@@ -98,13 +99,17 @@ class DB(ConjunctiveGraph):
             timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
         g = self.latest(graph)
         with self.conn() as conn:
-            for row in conn.execute("SELECT * FROM changesets WHERE graph = ? AND timestamp > ?", (graph, timestamp)):
+            for row in conn.execute(
+                "SELECT * FROM changesets WHERE graph = ? AND timestamp > ?",
+                (graph, timestamp),
+            ):
                 triple = pickle.loads(row["triple"])
                 if row["is_insertion"]:
                     g.add((triple[0], triple[1], triple[2]))
                 else:
                     g.remove((triple[0], triple[1], triple[2]))
         return g
+
 
 if __name__ == "__main__":
     db = DB("test.db")
@@ -121,7 +126,9 @@ if __name__ == "__main__":
         # 'cs' is a rdflib.Graph that supports queries -- updates on it
         # are buffered in the transaction and cannot be queried until
         # the transaction is committed (at the end of the context block)
-        cs.load_file("https://github.com/BrickSchema/Brick/releases/download/nightly/Brick.ttl")
+        cs.load_file(
+            "https://github.com/BrickSchema/Brick/releases/download/nightly/Brick.ttl"
+        )
 
     with db.new_changeset("my-building", 2) as cs:
         cs.add((BLDG.vav2, A, BRICK.VAV))
