@@ -1,4 +1,5 @@
 from datetime import datetime
+import logging
 from collections import OrderedDict
 import uuid
 import time
@@ -6,14 +7,14 @@ from contextlib import contextmanager
 from rdflib import Namespace
 from brickschema.namespaces import BRICK, A
 from rdflib import Graph, ConjunctiveGraph
+from rdflib.graph import BatchAddGraph
 from rdflib import plugin
 from rdflib.store import Store
 from rdflib_sqlalchemy import registerplugins
 import pickle
 
 registerplugins()
-
-BLDG = Namespace("urn:bldg#")
+logger = logging.getLogger(__name__)
 
 changeset_table_defn = """CREATE TABLE IF NOT EXISTS changesets (
     id TEXT,
@@ -22,9 +23,12 @@ changeset_table_defn = """CREATE TABLE IF NOT EXISTS changesets (
     is_insertion BOOLEAN NOT NULL,
     triple BLOB NOT NULL
 );"""
+changeset_table_idx = """CREATE INDEX IF NOT EXISTS changesets_idx
+                        ON changesets (graph, timestamp);"""
 
 class Changeset(Graph):
     def __init__(self, graph_name):
+        super().__init__()
         self.name = graph_name
         self.uid = uuid.uuid4()
         self.additions = []
@@ -32,14 +36,21 @@ class Changeset(Graph):
 
     def add(self, triple):
         self.additions.append(triple)
+        super().add(triple)
 
     def load_file(self, filename):
         g = Graph()
         g.parse(filename, format="turtle")
         self.additions.extend(g.triples((None, None, None)))
+        self += g
+
+        # propagate namespaces
+        for pfx, ns in g.namespace_manager.namespaces():
+            self.bind(pfx, ns)
 
     def remove(self, triple):
         self.deletions.append(triple)
+        super().remove(triple)
 
 
 class DB(ConjunctiveGraph):
@@ -49,13 +60,36 @@ class DB(ConjunctiveGraph):
         self.file_name = file_name
         self.open(f"sqlite:///{self.file_name}", create=True)
 
+        self._latest_version = None
         self._precommit_hooks = OrderedDict()
         self._postcommit_hooks = OrderedDict()
 
         with self.conn() as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
+            #conn.execute("PRAGMA journal_mode=WAL;")
             #conn.execute("PRAGMA synchronous=OFF;")
             conn.execute(changeset_table_defn)
+            conn.execute(changeset_table_idx)
+
+    def __len__(self):
+        # need to override __len__ because the rdflib-sqlalchemy
+        # backend doesn't support .count() for recent versions of
+        # SQLAlchemy
+        return len(list(self.triples((None, None, None))))
+
+    def versions(self, graph=None):
+        """
+        Return a list of all versions of the provided graph; defaults
+        to the union of all graphs
+        """
+        with self.conn() as conn:
+            if graph is None:
+                rows = conn.execute("SELECT DISTINCT id, graph, timestamp from changesets "
+                                    "ORDER BY timestamp DESC")
+            else:
+                rows = conn.execute("SELECT DISTINCT id, graph, timestamp from changesets "
+                                    "WHERE graph = ? ORDER BY timestamp DESC",
+                                    (graph,))
+            return list(rows)
 
     def add_precommit_hook(self, hook):
         self._precommit_hooks[hook.__name__] = hook
@@ -69,8 +103,8 @@ class DB(ConjunctiveGraph):
 
     @contextmanager
     def new_changeset(self, graph_name, ts=None):
+        namespaces = []
         with self.conn() as conn:
-            graph = self.get_context(graph_name)
             transaction_start = time.time()
             cs = Changeset(graph_name)
             yield cs
@@ -87,6 +121,7 @@ class DB(ConjunctiveGraph):
                         for triple in cs.deletions
                     ],
                 )
+                graph = self.get_context(graph_name)
                 for triple in cs.deletions:
                     graph.remove(triple)
             if cs.additions:
@@ -97,18 +132,32 @@ class DB(ConjunctiveGraph):
                         for triple in cs.additions
                     ],
                 )
-                graph.addN(((t[0], t[1], t[2], graph_name) for t in cs.additions))
-                #for triple in cs.additions:
-                #    graph.add(triple)
+                with BatchAddGraph(self.get_context(graph_name), batch_size=10000) as graph:
+                    for triple in cs.additions:
+                        graph.add(triple)
+
+
+            # take care of precommit hooks
             transaction_end = time.time()
-            print(f"Transaction took {transaction_end - transaction_start} seconds")
             for hook in self._precommit_hooks.values():
                 hook(self)
+            # keep track of namespaces so we can add them to the graph
+            # after the commit
+            namespaces.extend(cs.namespace_manager.namespaces())
+            logging.info(f"Committing after {transaction_end - transaction_start} seconds")
+        # update namespaces
+        for pfx, ns in namespaces:
+            self.bind(pfx, ns)
         for hook in self._postcommit_hooks.values():
             hook(self)
+        self._latest_version = ts
 
     def latest(self, graph):
         return self.get_context(graph)
+
+    @property
+    def latest_version(self):
+        return self._latest_version
 
     def graph_at(self, graph=None, timestamp=None):
         """
@@ -118,14 +167,23 @@ class DB(ConjunctiveGraph):
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
         g = Graph()
+        for pfx, ns in self.namespace_manager.namespaces():
+            g.bind(pfx, ns)
         if graph is not None:
             for t in self.get_context(graph).triples((None, None, None)):
                 g.add(t)
         with self.conn() as conn:
-            for row in conn.execute(
-                "SELECT * FROM changesets WHERE graph = ? AND timestamp > ?",
-                (graph, timestamp),
-            ):
+            if graph is not None:
+                rows = conn.execute(
+                    "SELECT * FROM changesets WHERE graph = ? AND timestamp >= ? ORDER BY timestamp DESC",
+                    (graph, timestamp),
+                )
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM changesets WHERE timestamp >= ? ORDER BY timestamp DESC",
+                    (timestamp,),
+                )
+            for row in rows:
                 triple = pickle.loads(row["triple"])
                 if row["is_insertion"]:
                     g.add((triple[0], triple[1], triple[2]))
@@ -135,7 +193,10 @@ class DB(ConjunctiveGraph):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
     db = DB("test.db")
+    BLDG = Namespace("urn:bldg#")
+    db.bind('bldg', BLDG)
 
     # can add precommit and postcommit hooks to implement desired functionality
     # precommit hooks are run *before* the transaction is committed but *after* all of
@@ -143,7 +204,7 @@ if __name__ == "__main__":
     # postcommit hooks are run *after* the transaction is committed.
     import pyshacl
     def validate(graph):
-        print("Validating graph")
+        logging.info("Validating graph")
         valid, _, report = pyshacl.validate(graph, advanced=True, allow_warnings=True)
         assert valid, report
     db.add_postcommit_hook(validate)
@@ -158,8 +219,8 @@ if __name__ == "__main__":
 
     with db.new_changeset("brick", 1) as cs:
         # 'cs' is a rdflib.Graph that supports queries -- updates on it
-        # are buffered in the transaction and cannot be queried until
-        # the transaction is committed (at the end of the context block)
+        # are buffered in the transaction and can be queried from w/n
+        # the transaction.
         cs.load_file(
             "https://sparql.gtf.fyi/ttl/Brick1.3rc1.ttl"
         )
