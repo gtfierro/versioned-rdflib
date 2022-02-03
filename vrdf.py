@@ -25,6 +25,13 @@ changeset_table_defn = """CREATE TABLE IF NOT EXISTS changesets (
 );"""
 changeset_table_idx = """CREATE INDEX IF NOT EXISTS changesets_idx
                         ON changesets (graph, timestamp);"""
+redo_table_defn = """CREATE TABLE IF NOT EXISTS redos (
+    id TEXT,
+    timestamp TIMESTAMP NOT NULL,
+    graph TEXT NOT NULL,
+    is_insertion BOOLEAN NOT NULL,
+    triple BLOB NOT NULL
+);"""
 
 class Changeset(Graph):
     def __init__(self, graph_name):
@@ -60,21 +67,42 @@ class DB(ConjunctiveGraph):
         self.file_name = file_name
         self.open(f"sqlite:///{self.file_name}", create=True)
 
-        self._latest_version = None
         self._precommit_hooks = OrderedDict()
         self._postcommit_hooks = OrderedDict()
 
         with self.conn() as conn:
-            #conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA journal_mode=WAL;")
             #conn.execute("PRAGMA synchronous=OFF;")
             conn.execute(changeset_table_defn)
             conn.execute(changeset_table_idx)
+            conn.execute(redo_table_defn)
+
+    @property
+    def latest_version(self):
+        with self.conn() as conn:
+            rows = conn.execute("SELECT id, timestamp from changesets "
+                                "ORDER BY timestamp DESC LIMIT 1")
+            res = rows.fetchone()
+            return res
 
     def __len__(self):
         # need to override __len__ because the rdflib-sqlalchemy
         # backend doesn't support .count() for recent versions of
         # SQLAlchemy
         return len(list(self.triples((None, None, None))))
+
+    def undo(self):
+        """
+        Undoes the given changeset. If no changeset is given,
+        undoes the most recent changeset.
+        """
+        if self.latest_version is None:
+            raise Exception("No changesets to undo")
+        with self.conn() as conn:
+            changeset_id = self.latest_version['id']
+            self._graph_at(self, conn, self.latest_version["timestamp"])
+            conn.execute("INSERT INTO redos SELECT * FROM changesets WHERE id = ?", (changeset_id,))
+            conn.execute("DELETE FROM changesets WHERE id = ?", (changeset_id,))
 
     def versions(self, graph=None):
         """
@@ -155,23 +183,11 @@ class DB(ConjunctiveGraph):
     def latest(self, graph):
         return self.get_context(graph)
 
-    @property
-    def latest_version(self):
-        return self._latest_version
-
     def graph_at(self, timestamp=None, graph=None):
-        """
-        Return *copy* of the graph at the given timestamp. Chooses the most recent timestamp
-        that is less than or equal to the given timestamp.
-        """
-        if timestamp is None:
-            timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
-
         # setup graph and bind namespaces
         g = Graph()
         for pfx, ns in self.namespace_manager.namespaces():
             g.bind(pfx, ns)
-
         # if graph is specified, only copy triples from that graph.
         # otherwise, copy triples from all graphs.
         if graph is not None:
@@ -181,23 +197,33 @@ class DB(ConjunctiveGraph):
             for t in self.triples((None, None, None)):
                 g.add(t)
         with self.conn() as conn:
-            if graph is not None:
-                rows = conn.execute(
-                    "SELECT * FROM changesets WHERE graph = ? AND timestamp >= ? ORDER BY timestamp DESC",
-                    (graph, timestamp),
-                )
+            return self._graph_at(g, conn, timestamp, graph)
+
+    def _graph_at(self, alter_graph, conn, timestamp=None, graph=None):
+        """
+        Return *copy* of the graph at the given timestamp. Chooses the most recent timestamp
+        that is less than or equal to the given timestamp.
+        """
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
+
+        if graph is not None:
+            rows = conn.execute(
+                "SELECT * FROM changesets WHERE graph = ? AND timestamp >= ? ORDER BY timestamp DESC",
+                (graph, timestamp),
+            )
+        else:
+            rows = conn.execute(
+                "SELECT * FROM changesets WHERE timestamp >= ? ORDER BY timestamp DESC",
+                (timestamp,),
+            )
+        for row in rows:
+            triple = pickle.loads(row["triple"])
+            if row["is_insertion"]:
+                alter_graph.add((triple[0], triple[1], triple[2]))
             else:
-                rows = conn.execute(
-                    "SELECT * FROM changesets WHERE timestamp >= ? ORDER BY timestamp DESC",
-                    (timestamp,),
-                )
-            for row in rows:
-                triple = pickle.loads(row["triple"])
-                if row["is_insertion"]:
-                    g.add((triple[0], triple[1], triple[2]))
-                else:
-                    g.remove((triple[0], triple[1], triple[2]))
-        return g
+                alter_graph.remove((triple[0], triple[1], triple[2]))
+        return alter_graph
 
 
 if __name__ == "__main__":
