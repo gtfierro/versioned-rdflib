@@ -100,9 +100,31 @@ class DB(ConjunctiveGraph):
             raise Exception("No changesets to undo")
         with self.conn() as conn:
             changeset_id = self.latest_version['id']
+            logger.info(f"Undoing changeset {changeset_id}")
             self._graph_at(self, conn, self.latest_version["timestamp"])
             conn.execute("INSERT INTO redos SELECT * FROM changesets WHERE id = ?", (changeset_id,))
             conn.execute("DELETE FROM changesets WHERE id = ?", (changeset_id,))
+
+    def redo(self):
+        """
+        Redoes the most recent changeset.
+        """
+        with self.conn() as conn:
+            redo_record = conn.execute("SELECT * from redos "
+                                        "ORDER BY timestamp ASC LIMIT 1").fetchone()
+            if redo_record is None:
+                raise Exception("No changesets to redo")
+            changeset_id = redo_record['id']
+            logger.info(f"Redoing changeset {changeset_id}")
+            conn.execute("INSERT INTO changesets SELECT * FROM redos WHERE id = ?", (changeset_id,))
+            conn.execute("DELETE FROM redos WHERE id = ?", (changeset_id,))
+            self._graph_at(self, conn, redo_record["timestamp"])
+            for row in conn.execute("SELECT * from changesets WHERE id = ?", (changeset_id,)):
+                triple = pickle.loads(row["triple"])
+                if row["is_insertion"]:
+                    self.remove((triple[0], triple[1], triple[2]))
+                else:
+                    self.add((triple[0], triple[1], triple[2]))
 
     def versions(self, graph=None):
         """
