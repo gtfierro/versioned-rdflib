@@ -1,6 +1,9 @@
 # Versioned RDF
 
 - `graph_at` doesn't  currently work
+- add `undo/redo` functions that actually mutate the graph
+- `undo` a particular transation?
+- integrate into Brickschema
 - TODOs:
     - incorporate research on how to do versioning:
         - https://rdfostrich.github.io/article-versioned-reasoning/

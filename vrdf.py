@@ -159,18 +159,26 @@ class DB(ConjunctiveGraph):
     def latest_version(self):
         return self._latest_version
 
-    def graph_at(self, graph=None, timestamp=None):
+    def graph_at(self, timestamp=None, graph=None):
         """
         Return *copy* of the graph at the given timestamp. Chooses the most recent timestamp
         that is less than or equal to the given timestamp.
         """
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
+
+        # setup graph and bind namespaces
         g = Graph()
         for pfx, ns in self.namespace_manager.namespaces():
             g.bind(pfx, ns)
+
+        # if graph is specified, only copy triples from that graph.
+        # otherwise, copy triples from all graphs.
         if graph is not None:
             for t in self.get_context(graph).triples((None, None, None)):
+                g.add(t)
+        else:
+            for t in self.triples((None, None, None)):
                 g.add(t)
         with self.conn() as conn:
             if graph is not None:
