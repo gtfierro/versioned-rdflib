@@ -133,7 +133,6 @@ class DB(ConjunctiveGraph):
                 "SELECT * from changesets WHERE id = ?", (changeset_id,)
             ):
                 triple = pickle.loads(row["triple"])
-                print(triple)
                 if row["is_insertion"]:
                     self.remove((triple[0], triple[1], triple[2]))
                 else:
