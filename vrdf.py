@@ -33,6 +33,7 @@ redo_table_defn = """CREATE TABLE IF NOT EXISTS redos (
     triple BLOB NOT NULL
 );"""
 
+
 class Changeset(Graph):
     def __init__(self, graph_name):
         super().__init__()
@@ -72,7 +73,7 @@ class DB(ConjunctiveGraph):
 
         with self.conn() as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
-            #conn.execute("PRAGMA synchronous=OFF;")
+            # conn.execute("PRAGMA synchronous=OFF;")
             conn.execute(changeset_table_defn)
             conn.execute(changeset_table_idx)
             conn.execute(redo_table_defn)
@@ -80,8 +81,10 @@ class DB(ConjunctiveGraph):
     @property
     def latest_version(self):
         with self.conn() as conn:
-            rows = conn.execute("SELECT id, timestamp from changesets "
-                                "ORDER BY timestamp DESC LIMIT 1")
+            rows = conn.execute(
+                "SELECT id, timestamp from changesets "
+                "ORDER BY timestamp DESC LIMIT 1"
+            )
             res = rows.fetchone()
             return res
 
@@ -99,10 +102,13 @@ class DB(ConjunctiveGraph):
         if self.latest_version is None:
             raise Exception("No changesets to undo")
         with self.conn() as conn:
-            changeset_id = self.latest_version['id']
+            changeset_id = self.latest_version["id"]
             logger.info(f"Undoing changeset {changeset_id}")
             self._graph_at(self, conn, self.latest_version["timestamp"])
-            conn.execute("INSERT INTO redos SELECT * FROM changesets WHERE id = ?", (changeset_id,))
+            conn.execute(
+                "INSERT INTO redos(id, timestamp, graph, is_insertion, triple) SELECT id, timestamp, graph, is_insertion, triple FROM changesets WHERE id = ?",
+                (changeset_id,),
+            )
             conn.execute("DELETE FROM changesets WHERE id = ?", (changeset_id,))
 
     def redo(self):
@@ -110,17 +116,24 @@ class DB(ConjunctiveGraph):
         Redoes the most recent changeset.
         """
         with self.conn() as conn:
-            redo_record = conn.execute("SELECT * from redos "
-                                        "ORDER BY timestamp ASC LIMIT 1").fetchone()
+            redo_record = conn.execute(
+                "SELECT * from redos " "ORDER BY timestamp ASC LIMIT 1"
+            ).fetchone()
             if redo_record is None:
                 raise Exception("No changesets to redo")
-            changeset_id = redo_record['id']
+            changeset_id = redo_record["id"]
             logger.info(f"Redoing changeset {changeset_id}")
-            conn.execute("INSERT INTO changesets SELECT * FROM redos WHERE id = ?", (changeset_id,))
+            conn.execute(
+                "INSERT INTO changesets SELECT * FROM redos WHERE id = ?",
+                (changeset_id,),
+            )
             conn.execute("DELETE FROM redos WHERE id = ?", (changeset_id,))
             self._graph_at(self, conn, redo_record["timestamp"])
-            for row in conn.execute("SELECT * from changesets WHERE id = ?", (changeset_id,)):
+            for row in conn.execute(
+                "SELECT * from changesets WHERE id = ?", (changeset_id,)
+            ):
                 triple = pickle.loads(row["triple"])
+                print(triple)
                 if row["is_insertion"]:
                     self.remove((triple[0], triple[1], triple[2]))
                 else:
@@ -133,12 +146,16 @@ class DB(ConjunctiveGraph):
         """
         with self.conn() as conn:
             if graph is None:
-                rows = conn.execute("SELECT DISTINCT id, graph, timestamp from changesets "
-                                    "ORDER BY timestamp DESC")
+                rows = conn.execute(
+                    "SELECT DISTINCT id, graph, timestamp from changesets "
+                    "ORDER BY timestamp DESC"
+                )
             else:
-                rows = conn.execute("SELECT DISTINCT id, graph, timestamp from changesets "
-                                    "WHERE graph = ? ORDER BY timestamp DESC",
-                                    (graph,))
+                rows = conn.execute(
+                    "SELECT DISTINCT id, graph, timestamp from changesets "
+                    "WHERE graph = ? ORDER BY timestamp DESC",
+                    (graph,),
+                )
             return list(rows)
 
     def add_precommit_hook(self, hook):
@@ -159,7 +176,7 @@ class DB(ConjunctiveGraph):
             cs = Changeset(graph_name)
             yield cs
             if ts is None:
-                ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
+                ts = datetime.now().isoformat()
             # delta by the user. We need to invert the changes so that they are expressed as a "backward"
             # delta. This means that we save the deletions in the changeset as "inserts", and the additions
             # as "deletions".
@@ -182,10 +199,11 @@ class DB(ConjunctiveGraph):
                         for triple in cs.additions
                     ],
                 )
-                with BatchAddGraph(self.get_context(graph_name), batch_size=10000) as graph:
+                with BatchAddGraph(
+                    self.get_context(graph_name), batch_size=10000
+                ) as graph:
                     for triple in cs.additions:
                         graph.add(triple)
-
 
             # take care of precommit hooks
             transaction_end = time.time()
@@ -194,7 +212,13 @@ class DB(ConjunctiveGraph):
             # keep track of namespaces so we can add them to the graph
             # after the commit
             namespaces.extend(cs.namespace_manager.namespaces())
-            logging.info(f"Committing after {transaction_end - transaction_start} seconds")
+
+            # # finally, remove all of the 'redos'
+            # conn.execute("DELETE FROM redos")
+            # # and remove all of the 'changesets' that come after us
+            logging.info(
+                f"Committing after {transaction_end - transaction_start} seconds"
+            )
         # update namespaces
         for pfx, ns in namespaces:
             self.bind(pfx, ns)
@@ -227,7 +251,7 @@ class DB(ConjunctiveGraph):
         that is less than or equal to the given timestamp.
         """
         if timestamp is None:
-            timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S%Z")
+            timestamp = datetime.now().isoformat()
 
         if graph is not None:
             rows = conn.execute(
@@ -252,17 +276,19 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
     db = DB("test.db")
     BLDG = Namespace("urn:bldg#")
-    db.bind('bldg', BLDG)
+    db.bind("bldg", BLDG)
 
     # can add precommit and postcommit hooks to implement desired functionality
     # precommit hooks are run *before* the transaction is committed but *after* all of
     # the changes have been made to the graph.
     # postcommit hooks are run *after* the transaction is committed.
     import pyshacl
+
     def validate(graph):
         logging.info("Validating graph")
         valid, _, report = pyshacl.validate(graph, advanced=True, allow_warnings=True)
         assert valid, report
+
     db.add_postcommit_hook(validate)
 
     # using logical timestamps here (0, 1, 2, 3, ...). If these are
@@ -277,9 +303,7 @@ if __name__ == "__main__":
         # 'cs' is a rdflib.Graph that supports queries -- updates on it
         # are buffered in the transaction and can be queried from w/n
         # the transaction.
-        cs.load_file(
-            "https://sparql.gtf.fyi/ttl/Brick1.3rc1.ttl"
-        )
+        cs.load_file("https://sparql.gtf.fyi/ttl/Brick1.3rc1.ttl")
 
     with db.new_changeset("my-building", 2) as cs:
         cs.add((BLDG.vav2, A, BRICK.VAV))
